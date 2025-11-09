@@ -2328,7 +2328,7 @@ func main() {
 		os.Exit(1)
 	}
 	media := flag.String("media", "", "存储下载媒体文件的路径（必须）")
-	port := flag.Int("port", 8080, "HTTP 服务器端口（默认 8080）")
+	port := flag.Int("port", 9801, "HTTP 服务器端口（默认 9801）")
 	flag.Parse()
 	// 初始化日志缓冲区（使用默认大小，稍后根据配置调整）
 	logsMu.Lock()
