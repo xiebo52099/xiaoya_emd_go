@@ -325,7 +325,7 @@ async function saveInterval() {
     
     // 前端验证
     if (isNaN(interval) || interval < 1 || interval > 1440) {
-        showStatus('同步间隔必须为 1-1440 分钟', 'error');
+        showStatus('同步间隔必须为 1-1440 分钟', true);
         intervalInput.focus();
         return;
     }
@@ -342,17 +342,17 @@ async function saveInterval() {
         });
         
         if (response.ok) {
-            showStatus(`同步间隔已更新为 ${interval} 分钟`, 'success');
+            showStatus(`同步间隔已更新为 ${interval} 分钟`);
             document.getElementById('syncIntervalDisplay').textContent = `${interval} 分钟`;
             // 刷新同步状态显示
             getSyncStatus();
         } else {
             const errorText = await response.text();
-            showStatus(`保存失败: ${errorText}`, 'error');
+            showStatus(`保存失败: ${errorText}`, true);
         }
     } catch (error) {
         console.error('保存间隔失败:', error);
-        showStatus('保存失败，请检查网络连接', 'error');
+        showStatus('保存失败，请检查网络连接', true);
     }
 }
 
@@ -749,7 +749,7 @@ window.onload = () => {
     setTimeout(() => {
         const intervalInput = document.getElementById('syncInterval');
         if (intervalInput && !intervalInput.value) {
-            intervalInput.value = 30;
+            intervalInput.value = 60;
         }
     }, 1000);
 };
