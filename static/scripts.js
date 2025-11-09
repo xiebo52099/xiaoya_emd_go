@@ -8,11 +8,13 @@ function showStatus(message, isError = false) {
     status.style.display = 'block';
     setTimeout(() => status.style.display = 'none', 3000);
 }
+
 // 初始化主题
 function initTheme() {
     const savedTheme = localStorage.getItem('theme') || ''; // 默认亮色（空字符串）
     document.body.dataset.theme = savedTheme;
 }
+
 // 切换主题
 function toggleTheme() {
     const body = document.body;
@@ -212,9 +214,9 @@ async function getSyncStatus() {
         runningStatus.className = status.isRunning ? 'sync-running' : 'sync-waiting';
         message.textContent = status.message;
         nextRun.textContent = status.nextRun || '-';
-        intervalDisplay.textContent = status.interval ? `${status.interval} 小时` : '-';
+        intervalDisplay.textContent = status.interval ? `${status.interval} 分钟` : '-'; // 改为分钟
         if (!intervalInput.dataset.initialized) {
-            intervalInput.placeholder = status.interval ? `${status.interval}小时` : '小时';
+            intervalInput.placeholder = status.interval ? `${status.interval}分钟` : '分钟'; // 改为分钟
             intervalInput.dataset.initialized = 'true';
         }
         localTimestamp.textContent = config.scanListTime ? new Date(config.scanListTime).toLocaleString() : '未知';
@@ -250,6 +252,7 @@ async function stopSync() {
         showStatus(`停止失败: ${error.message}`, true);
     }
 }
+
 async function loadPaths() {
     try {
         const { allPaths, activePaths, pathUpdateNotices } = await fetchAPI('/api/paths');
@@ -313,8 +316,8 @@ async function savePaths() {
 
 async function saveInterval() {
     const interval = parseInt(document.getElementById('syncInterval').value);
-    if (isNaN(interval) || interval < 1 || interval > 24) {
-        showStatus('同步间隔必须为 1-24 的整数', true);
+    if (isNaN(interval) || interval < 1 || interval > 1440) { // 改为1-1440分钟
+        showStatus('同步间隔必须为 1-1440 的整数（分钟）', true); // 更新错误提示
         return;
     }
     try {
@@ -323,7 +326,7 @@ async function saveInterval() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ interval })
         });
-        showStatus(`同步间隔已设置为 ${interval} 小时`);
+        showStatus(`同步间隔已设置为 ${interval} 分钟`); // 改为分钟
         getSyncStatus();
     } catch (error) {
         showStatus(`保存失败: ${error.message}`, true);
@@ -538,6 +541,7 @@ async function saveConcurrencyConfig() {
         showStatus(`保存失败: ${error.message}`, true);
     }
 }
+
 //加载回收站数量
 async function loadRecycleBinCount() {
     try {
@@ -548,6 +552,7 @@ async function loadRecycleBinCount() {
         showStatus(`加载回收站文件数量失败: ${error.message}`, true);
     }
 }
+
 async function resetScanListTime() {
     try {
         const response = await fetchAPI('/api/reset-scanlist-time', { method: 'POST' });
@@ -560,6 +565,7 @@ async function resetScanListTime() {
         showStatus(`重置数据包时间失败: ${error.message}`, true);
     }
 }
+
 async function exportRecycleBinList() {
     try {
         const response = await fetch('/api/recycle-bin/list');
@@ -581,6 +587,7 @@ async function exportRecycleBinList() {
         showStatus(`导出失败: ${error.message}`, true);
     }
 }
+
 async function clearRecycleBin() {
     try {
         const data = await fetchAPI('/api/recycle-bin/count');
@@ -691,6 +698,7 @@ async function triggerGC() {
         showStatus(`触发垃圾回收失败: ${error.message}`, true);
     }
 }
+
 window.onload = () => {
     initTheme(); // 初始化主题
     getSyncStatus();
