@@ -1683,9 +1683,9 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		addLog("info", fmt.Sprintf("同步目录保存成功，共 %d 个", len(config.ActivePaths)))
 	}
 	if newConfig.Interval != nil {
-		if *newConfig.Interval <= 0 || *newConfig.Interval > 24 {
+		if *newConfig.Interval <= 0 || *newConfig.Interval > 1440 {
 			configMu.Unlock()
-			http.Error(w, "同步间隔必须为 1-24 的正整数", http.StatusBadRequest)
+			http.Error(w, "同步间隔必须为 1-1440 的正整数", http.StatusBadRequest)
 			return
 		}
 		config.Interval = *newConfig.Interval
