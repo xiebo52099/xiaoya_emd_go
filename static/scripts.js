@@ -210,15 +210,20 @@ async function getSyncStatus() {
         const localTimestamp = document.getElementById('localTimestamp');
         const startBtn = document.getElementById('startSyncBtn');
         const stopBtn = document.getElementById('stopSyncBtn');
+        
         runningStatus.textContent = status.isRunning ? '运行中' : '已停止';
         runningStatus.className = status.isRunning ? 'sync-running' : 'sync-waiting';
         message.textContent = status.message;
         nextRun.textContent = status.nextRun || '-';
-        intervalDisplay.textContent = status.interval ? `${status.interval} 分钟` : '-'; // 改为分钟
-        if (!intervalInput.dataset.initialized) {
-            intervalInput.placeholder = status.interval ? `${status.interval}分钟` : '分钟'; // 改为分钟
-            intervalInput.dataset.initialized = 'true';
+        intervalDisplay.textContent = status.interval ? `${status.interval} 分钟` : '-';
+        
+        // 修复：设置输入框的实际值
+        if (status.interval) {
+            intervalInput.value = status.interval;
+        } else if (!intervalInput.value) {
+            intervalInput.value = 60; // 默认值
         }
+        
         localTimestamp.textContent = config.scanListTime ? new Date(config.scanListTime).toLocaleString() : '未知';
         startBtn.disabled = status.isRunning;
         stopBtn.disabled = !status.isRunning;
@@ -315,21 +320,39 @@ async function savePaths() {
 }
 
 async function saveInterval() {
-    const interval = parseInt(document.getElementById('syncInterval').value);
-    if (isNaN(interval) || interval < 1 || interval > 1440) { // 改为1-1440分钟
-        showStatus('同步间隔必须为 1-1440 的整数（分钟）', true); // 更新错误提示
+    const intervalInput = document.getElementById('syncInterval');
+    const interval = parseInt(intervalInput.value);
+    
+    // 前端验证
+    if (isNaN(interval) || interval < 1 || interval > 1440) {
+        showStatus('同步间隔必须为 1-1440 分钟', 'error');
+        intervalInput.focus();
         return;
     }
+    
     try {
-        await fetchAPI('/api/config', {
+        const response = await fetch('/api/config', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ interval })
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                interval: interval
+            })
         });
-        showStatus(`同步间隔已设置为 ${interval} 分钟`); // 改为分钟
-        getSyncStatus();
+        
+        if (response.ok) {
+            showStatus(`同步间隔已更新为 ${interval} 分钟`, 'success');
+            document.getElementById('syncIntervalDisplay').textContent = `${interval} 分钟`;
+            // 刷新同步状态显示
+            getSyncStatus();
+        } else {
+            const errorText = await response.text();
+            showStatus(`保存失败: ${errorText}`, 'error');
+        }
     } catch (error) {
-        showStatus(`保存失败: ${error.message}`, true);
+        console.error('保存间隔失败:', error);
+        showStatus('保存失败，请检查网络连接', 'error');
     }
 }
 
@@ -699,6 +722,21 @@ async function triggerGC() {
     }
 }
 
+// 添加输入验证
+document.addEventListener('DOMContentLoaded', function() {
+    const intervalInput = document.getElementById('syncInterval');
+    if (intervalInput) {
+        intervalInput.addEventListener('change', function(e) {
+            let value = parseInt(e.target.value);
+            if (isNaN(value) || value < 1) {
+                e.target.value = 1;
+            } else if (value > 1440) {
+                e.target.value = 1440;
+            }
+        });
+    }
+});
+
 window.onload = () => {
     initTheme(); // 初始化主题
     getSyncStatus();
@@ -706,4 +744,12 @@ window.onload = () => {
     loadRecycleBinCount();
     setInterval(getSyncStatus, 5000);
     setInterval(loadResourceUsage, 3000);// 每 3 秒刷新资源使用情况
+    
+    // 添加：确保输入框有默认值
+    setTimeout(() => {
+        const intervalInput = document.getElementById('syncInterval');
+        if (intervalInput && !intervalInput.value) {
+            intervalInput.value = 30;
+        }
+    }, 1000);
 };
