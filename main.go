@@ -44,7 +44,7 @@ type Config struct {
 	SPathsAll             []string        `json:"sPathsAll"`
 	SPool                 []string        `json:"sPool"`
 	ActivePaths           []string        `json:"activePaths"`
-	Interval              int             `json:"interval"` // 同步间隔（分钟）
+	Interval              int             `json:"interval"`
 	ScanListTime          time.Time       `json:"scanListTime"`
 	DNSType               DNSType         `json:"dnsType"`
 	DNSServer             string          `json:"dnsServer"`
@@ -503,7 +503,7 @@ func loadConfig() error {
 		// 根目录也没有 config.json，创建默认配置
 		configMu.Lock()
 		config = Config{
-			Interval:              60, // 默认改为 60 分钟（1小时）
+			Interval:              1,
 			DNSType:               DNSTypeDoH,
 			DNSServer:             "https://1.1.1.1/dns-query",
 			DNSEnabled:            true,
@@ -533,7 +533,7 @@ func loadConfig() error {
 		newConfig.LogSize = 1000
 	}
 	if newConfig.Interval <= 0 {
-		newConfig.Interval = 60
+		newConfig.Interval = 1
 	}
 	if newConfig.MaxConcurrency <= 0 {
 		newConfig.MaxConcurrency = 500
@@ -979,3 +979,1486 @@ func downloadFile(ctx context.Context, file FileInfo, servers []ServerInfo, medi
 			}
 			if err := os.Rename(localPath+".tmp", localPath); err != nil {
 				os.Remove(localPath + ".tmp")
+				return fmt.Errorf("重命名文件 %s 失败：%v", localPath, err)
+			}
+			modTime := time.Unix(file.Timestamp, 0)
+			if err := os.Chtimes(localPath, modTime, modTime); err != nil {
+				addLog("error", fmt.Sprintf("设置文件 %s 的时间戳失败：%v", localPath, err))
+				os.Remove(localPath)
+				return err
+			}
+			if i == 0 {
+				addLog("success", fmt.Sprintf("下载完成：%s", file.Path))
+			} else {
+				addLog("success", fmt.Sprintf("下载完成：%s，使用服务器：%s", file.Path, server.URL))
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("所有服务器下载 %s 失败：%s", file.Path, strings.Join(attemptErrors, "; "))
+}
+
+// deleteLocalFile 删除本地文件，移动到回收站
+func deleteLocalFile(mediaDir, path string) error {
+	localPath := filepath.Join(mediaDir, path)
+	recycleDir := filepath.Join(mediaDir, "recycle_bin")
+	recyclePath := filepath.Join(recycleDir, path)
+
+	if _, err := os.Stat(localPath); os.IsNotExist(err) {
+		addLog("warning", fmt.Sprintf("文件 %s 不存在，跳过移动到回收站", path))
+		return nil
+	} else if err != nil {
+		addLog("error", fmt.Sprintf("检查文件 %s 失败：%v", path, err))
+		return fmt.Errorf("检查文件 %s 失败：%v", path, err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(recyclePath), 0777); err != nil {
+		addLog("error", fmt.Sprintf("创建回收站目录 %s 失败：%v", filepath.Dir(recyclePath), err))
+		return fmt.Errorf("创建回收站目录失败：%v", err)
+	}
+
+	finalRecyclePath := recyclePath
+	if _, err := os.Stat(recyclePath); err == nil {
+		ext := filepath.Ext(path)
+		base := strings.TrimSuffix(filepath.Base(path), ext)
+		timestamp := time.Now().Format("20060102_150405")
+		newBase := fmt.Sprintf("%s_%s%s", base, timestamp, ext)
+		finalRecyclePath = filepath.Join(filepath.Dir(recyclePath), newBase)
+	}
+
+	if err := os.Rename(localPath, finalRecyclePath); err != nil {
+		addLog("error", fmt.Sprintf("移动文件 %s 到回收站 %s 失败：%v", path, finalRecyclePath, err))
+		return fmt.Errorf("移动文件失败：%v", err)
+	}
+
+	addLog("info", fmt.Sprintf("文件 %s 已移动到回收站 %s", path, finalRecyclePath))
+	return nil
+}
+
+// testMediaFolder 测试并创建媒体目录
+func testMediaFolder(media string, paths []string) bool {
+	for _, path := range paths {
+		fullPath := filepath.Join(media, path)
+		if _, err := os.Stat(fullPath); os.IsNotExist(err) {
+			if err := os.MkdirAll(fullPath, 0777); err != nil {
+				addLog("error", fmt.Sprintf("创建目录 %s 失败：%v", fullPath, err))
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// syncFiles 执行文件同步逻辑
+func syncFiles(media *string) {
+	if err := loadConfig(); err != nil {
+		addLog("error", fmt.Sprintf("初始加载配置文件失败：%v", err))
+		return
+	}
+	intervalChange := make(chan int, 1)
+	restartTicker := func(ticker *time.Ticker, interval int) *time.Ticker {
+		if ticker != nil {
+			ticker.Stop()
+		}
+		newTicker := time.NewTicker(time.Duration(interval) * time.Minute)
+		addLog("info", fmt.Sprintf("新的同步间隔：%d 分钟", interval))
+		return newTicker
+	}
+	configMu.RLock()
+	interval := config.Interval
+	configMu.RUnlock()
+	if interval <= 0 {
+		interval = 12
+		addLog("warning", "同步间隔无效，强制设置为 12 分钟")
+		configMu.Lock()
+		config.Interval = interval
+		configMu.Unlock()
+		if err := saveConfig(); err != nil {
+			addLog("error", fmt.Sprintf("保存默认间隔失败：%v", err))
+		}
+	}
+	ticker := time.NewTicker(time.Duration(interval) * time.Minute)
+	defer ticker.Stop()
+	mediaDir := filepath.Clean(*media)
+	scanListGzPath := ".scan.list.gz"
+
+	for {
+		syncStateMu.Lock()
+		running := syncState.Running
+		syncStateMu.Unlock()
+
+		if !running {
+			select {
+			case <-syncState.Trigger:
+				syncStateMu.Lock()
+				syncState.Running = true
+				syncState.LastStart = time.Now()
+				syncStateMu.Unlock()
+				addLog("info", "手动启动同步，开始新一轮同步")
+			case <-syncState.SyncDone:
+				syncStateMu.Lock()
+				syncState.Running = false
+				syncStateMu.Unlock()
+				addLog("info", "主同步任务暂停，等待触发")
+				continue
+			case newInterval := <-intervalChange:
+				configMu.Lock()
+				config.Interval = newInterval
+				configMu.Unlock()
+				ticker = restartTicker(ticker, newInterval)
+				continue
+			case <-ticker.C:
+				syncStateMu.Lock()
+				syncState.Running = true
+				syncState.LastStart = time.Now()
+				syncStateMu.Unlock()
+				addLog("info", "定时器触发，进入下一次同步")
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		} else {
+			syncStateMu.Lock()
+			syncState.LastStart = time.Now()
+			syncStateMu.Unlock()
+		}
+
+		startTime := time.Now()
+		configMu.RLock()
+		paths := config.ActivePaths
+		if len(paths) == 0 {
+			paths = config.SPathsAll
+		}
+		maxConcurrency := config.MaxConcurrency
+		configMu.RUnlock()
+
+		addLog("info", fmt.Sprintf("勾选同步路径：%v", paths))
+		if !testMediaFolder(mediaDir, paths) {
+			addLog("warning", fmt.Sprintf("%s 不包含所有目标文件夹，将创建缺失的目录", mediaDir))
+		}
+
+		// 清理 .tmp 文件
+		err := filepath.Walk(mediaDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() && strings.HasSuffix(path, ".tmp") {
+				if err := os.Remove(path); err != nil {
+					addLog("warning", fmt.Sprintf("清理临时文件 %s 失败：%v", path, err))
+				} else {
+					addLog("info", fmt.Sprintf("清理临时文件：%s", path))
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			addLog("warning", fmt.Sprintf("清理临时文件失败：%v", err))
+		}
+
+		// 扫描本地文件（仅在必要时执行）
+		localMap, err := scanLocalFilesToMap(mediaDir, paths)
+		if err != nil {
+			addLog("error", fmt.Sprintf("生成本地文件映射失败：%v", err))
+			continue
+		}
+
+		// 选择服务器
+		configMu.RLock()
+		servers := pickBestServers(config.SPool)
+		configMu.RUnlock()
+
+		if len(servers) == 0 {
+			addLog("error", "没有可用的服务器，等待 5 分钟后重试")
+			select {
+			case <-time.After(5 * time.Minute):
+				continue
+			case <-syncState.SyncDone:
+				syncStateMu.Lock()
+				syncState.Running = false
+				syncStateMu.Unlock()
+				addLog("info", "主同步任务暂停，等待触发")
+				continue
+			}
+		}
+
+		url := servers[0].URL
+		addLog("info", fmt.Sprintf("使用服务器：%s", url))
+
+		// 检查并下载 .scan.list.gz
+		isSame, serverTime, err := checkAndUpdateScanList(url, scanListGzPath)
+		if err != nil {
+			addLog("error", fmt.Sprintf("检查并更新数据包失败：%v", err))
+			continue
+		}
+
+		if isSame {
+			configMu.RLock()
+			nextRun := time.Now().Add(time.Duration(config.Interval) * time.Minute)
+			configMu.RUnlock()
+			addLog("info", fmt.Sprintf("服务器数据一致，等待下次检测，下次时间：%s", formatTime(nextRun)))
+
+			syncStateMu.Lock()
+			running := syncState.Running
+			syncStateMu.Unlock()
+
+			if running {
+				select {
+				case <-syncState.Trigger:
+					addLog("info", "手动触发同步，跳过等待")
+				case <-ticker.C:
+					addLog("info", "定时器触发，进入下一次同步")
+				case <-syncState.SyncDone:
+					syncStateMu.Lock()
+					syncState.Running = false
+					syncStateMu.Unlock()
+					addLog("info", "主同步任务暂停，等待触发")
+					continue
+				case <-time.After(time.Duration(interval) * time.Minute):
+					addLog("warning", "同步超时，强制进入下一次循环")
+				}
+			}
+			continue
+		}
+
+		// 生成服务器文件映射
+		serverInfo, err := generateServerMap(scanListGzPath, paths)
+		if err != nil {
+			addLog("error", fmt.Sprintf("生成服务器文件映射失败：%v", err))
+			continue
+		}
+		// 更新 ServerPathCounts
+		configMu.Lock()
+		if config.ServerPathCounts == nil {
+			config.ServerPathCounts = make(map[string]int)
+		}
+		for path, count := range serverInfo.Counts {
+			config.ServerPathCounts[path] = count
+		}
+		// 清理不存在的路径
+		for path := range config.ServerPathCounts {
+			if !contains(paths, path) {
+				delete(config.ServerPathCounts, path)
+			}
+		}
+		if err := saveConfig(); err != nil {
+			addLog("error", fmt.Sprintf("保存服务器路径计数失败：%v", err))
+		}
+		configMu.Unlock()
+
+		// 删除 .scan.list.gz
+		if err := os.Remove(scanListGzPath); err != nil && !os.IsNotExist(err) {
+			addLog("warning", fmt.Sprintf("删除数据包文件失败：%v", err))
+		}
+
+		// 对比差异
+		toUpdate, toDelete, err := compareAndPrepareSync(localMap.Files, serverInfo, paths)
+		if err != nil {
+			addLog("error", fmt.Sprintf("比较文件映射失败：%v", err))
+			continue
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			select {
+			case <-syncState.SyncDone:
+				addLog("info", "主同步任务被停止")
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
+
+		// 执行核心同步，并获取路径计数变化
+		successFiles, failedFiles, pathCountChanges, err := syncFilesCore(ctx, mediaDir, servers, toUpdate, toDelete, maxConcurrency, true)
+		cancel()
+
+		// 增量更新本地路径计数
+		updateLocalPathCounts(pathCountChanges, paths)
+
+		// 处理同步结果
+		syncStateMu.Lock()
+		running = syncState.Running
+		syncStateMu.Unlock()
+
+		if err == context.Canceled {
+			addLog("info", fmt.Sprintf("主同步被手动终止，耗时 %s，未更新 scanListTime", formatDuration(time.Since(startTime))))
+			if running {
+				addLog("info", "同步被终止，但运行状态仍为 true，立即开始新一轮同步")
+				continue
+			}
+			syncStateMu.Lock()
+			syncState.Running = false
+			syncStateMu.Unlock()
+			addLog("info", "主同步任务暂停，等待触发")
+			continue
+		}
+
+		// 更新 scanListTime
+		configMu.Lock()
+		config.ScanListTime = serverTime
+		if err := saveConfig(); err != nil {
+			addLog("error", fmt.Sprintf("更新配置文件时间失败：%v", err))
+		}
+		configMu.Unlock()
+
+		addLog("info", fmt.Sprintf("本地数据日期 为 %s", formatTime(serverTime)))
+
+		if err != nil {
+			addLog("error", fmt.Sprintf("核心同步失败：%v", err))
+			select {
+			case <-time.After(5 * time.Minute):
+				continue
+			case <-syncState.SyncDone:
+				syncStateMu.Lock()
+				syncState.Running = false
+				syncStateMu.Unlock()
+				addLog("info", "主同步任务暂停，等待触发")
+				continue
+			}
+		}
+
+		if running {
+			if len(failedFiles) > 0 {
+				addLog("warning", fmt.Sprintf("主同步完成，成功 %d 个文件，失败 %d 个文件，耗时 %s",
+					len(successFiles), len(failedFiles), formatDuration(time.Since(startTime))))
+			} else {
+				addLog("success", fmt.Sprintf("主同步完成，成功 %d 个文件，耗时 %s",
+					len(successFiles), formatDuration(time.Since(startTime))))
+			}
+
+			configMu.RLock()
+			nextRun := time.Now().Add(time.Duration(config.Interval) * time.Minute)
+			configMu.RUnlock()
+			runtime.GC()
+			addLog("info", fmt.Sprintf("同步完成，进入等待状态，下次检测时间：%s", formatTime(nextRun)))
+
+			syncStateMu.Lock()
+			syncState.LastStart = time.Now()
+			syncStateMu.Unlock()
+		}
+
+		// 等待下一轮同步
+		select {
+		case <-syncState.Trigger:
+			addLog("info", "手动触发同步，立即开始新一轮同步")
+			continue
+		case <-ticker.C:
+			addLog("info", "定时器触发，进入下一轮同步")
+			continue
+		case <-syncState.SyncDone:
+			syncStateMu.Lock()
+			syncState.Running = false
+			syncStateMu.Unlock()
+			addLog("info", "主同步任务暂停，等待触发")
+			continue
+		case <-time.After(time.Duration(interval) * time.Minute):
+			addLog("warning", "同步超时，强制进入下一次循环")
+			continue
+		}
+	}
+}
+
+// updateLocalPathCounts 增量更新本地路径计数
+func updateLocalPathCounts(pathCountChanges map[string]int, paths []string) {
+	configMu.Lock()
+	defer configMu.Unlock()
+
+	if config.LocalPathCounts == nil {
+		config.LocalPathCounts = make(map[string]int)
+	}
+
+	// 记录是否需要保存配置
+	needSave := false
+
+	// 增量更新计数
+	for path, change := range pathCountChanges {
+		if change != 0 {
+			currentCount, exists := config.LocalPathCounts[path]
+			if !exists {
+				currentCount = 0
+			}
+			newCount := currentCount + change
+			if newCount < 0 {
+				addLog("warning", fmt.Sprintf("路径 %s 的计数变为负数（%d），重置为 0", path, newCount))
+				newCount = 0
+			}
+			config.LocalPathCounts[path] = newCount
+			needSave = true
+		}
+	}
+
+	// 清理不存在的路径
+	for path := range config.LocalPathCounts {
+		if !contains(paths, path) {
+			delete(config.LocalPathCounts, path)
+			needSave = true
+		}
+	}
+
+	// 仅在计数发生变化时保存配置
+	if needSave {
+		if err := saveConfig(); err != nil {
+			addLog("error", fmt.Sprintf("更新本地文件数量失败：%v", err))
+		} else {
+			addLog("info", "更新本地文件数量完成")
+		}
+	}
+}
+
+// syncFilesCore 执行文件同步核心逻辑，并跟踪路径计数变化
+func syncFilesCore(ctx context.Context, mediaDir string, servers []ServerInfo, toUpdate []FileInfo, toDelete []string, maxConcurrency int, deleteFiles bool) ([]FileInfo, []string, map[string]int, error) {
+	startTime := time.Now()
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, maxConcurrency)
+	successFiles := make([]FileInfo, 0, len(toUpdate))
+	failedFiles := make([]string, 0, len(toDelete)+len(toUpdate))
+	pathCountChanges := make(map[string]int) // 路径计数增减变化
+	var successMu, failedMu sync.Mutex
+
+	// 初始化路径计数变化
+	configMu.RLock()
+	for _, path := range config.SPathsAll {
+		pathCountChanges[path] = 0
+	}
+	configMu.RUnlock()
+
+	// 第一步：处理删除
+	if deleteFiles && len(toDelete) > 0 {
+		addLog("info", "开始处理本地多余文件的删除")
+		for _, path := range toDelete {
+			select {
+			case <-ctx.Done():
+				addLog("info", "核心同步文件删除被取消")
+				return successFiles, failedFiles, pathCountChanges, ctx.Err()
+			default:
+				wg.Add(1)
+				go func(p string) {
+					defer wg.Done()
+					semaphore <- struct{}{}
+					defer func() { <-semaphore }()
+
+					if err := deleteLocalFile(mediaDir, p); err != nil {
+						failedMu.Lock()
+						failedFiles = append(failedFiles, p)
+						failedMu.Unlock()
+						addLog("error", fmt.Sprintf("删除 %s 失败：%v", p, err))
+					} else {
+						rootDir := getRootDir(p)
+						if rootDir != "" {
+							successMu.Lock()
+							pathCountChanges[rootDir]--
+							successMu.Unlock()
+						}
+					}
+				}(path)
+			}
+		}
+		wg.Wait()
+		addLog("info", fmt.Sprintf("删除完成，成功 %d 个，失败 %d 个", len(toDelete)-len(failedFiles), len(failedFiles)))
+	}
+
+	// 第二步：处理下载
+	if len(toUpdate) > 0 {
+		addLog("info", "开始处理文件下载和更新")
+		for _, file := range toUpdate {
+			select {
+			case <-ctx.Done():
+				addLog("info", "核心同步文件下载被取消")
+				return successFiles, failedFiles, pathCountChanges, ctx.Err()
+			default:
+				wg.Add(1)
+				go func(f FileInfo) {
+					defer wg.Done()
+					semaphore <- struct{}{}
+					defer func() { <-semaphore }()
+
+					cleanedPath := filepath.Join(filepath.Dir(f.Path), cleanFileName(filepath.Base(f.Path)))
+					if err := downloadFile(ctx, f, servers, mediaDir, cleanedPath); err != nil {
+						failedMu.Lock()
+						failedFiles = append(failedFiles, f.Path)
+						failedMu.Unlock()
+						addLog("error", fmt.Sprintf("下载 %s 失败：%v", f.Path, err))
+					} else {
+						successMu.Lock()
+						successFiles = append(successFiles, f)
+						rootDir := getRootDir(f.Path)
+						if rootDir != "" {
+							pathCountChanges[rootDir]++
+						}
+						successMu.Unlock()
+					}
+				}(file)
+			}
+		}
+		wg.Wait()
+	}
+
+	// 如果任务被取消，跳过后续处理
+	if ctx.Err() != nil {
+		addLog("info", fmt.Sprintf("核心同步被终止，耗时 %s", formatDuration(time.Since(startTime))))
+		return successFiles, failedFiles, pathCountChanges, ctx.Err()
+	}
+
+	addLog("success", fmt.Sprintf("核心同步完成，更新 %d 个文件，删除 %d 个文件，耗时 %s",
+		len(successFiles), len(toDelete)-len(failedFiles), formatDuration(time.Since(startTime))))
+	return successFiles, failedFiles, pathCountChanges, nil
+}
+
+// getRootDir 获取文件路径的根目录
+func getRootDir(filePath string) string {
+	parts := strings.Split(strings.TrimPrefix(filePath, "/"), "/")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0] + "/"
+}
+
+// checkAndUpdateScanList 检查并下载 .scan.list.gz 文件
+func checkAndUpdateScanList(serverURL, localPath string) (bool, time.Time, error) {
+	//addLog("info", fmt.Sprintf("检查服务器 %s 数据包时间", serverURL))
+	resp, err := httpClient.Get(serverURL + "/.scan.list.gz")
+	if err != nil {
+		return false, time.Time{}, fmt.Errorf("请求服务器数据包失败：%v", err)
+	}
+	defer resp.Body.Close()
+
+	serverTimeStr := resp.Header.Get("Last-Modified")
+	serverTime, err := time.Parse(time.RFC1123, serverTimeStr)
+	if err != nil {
+		addLog("warning", fmt.Sprintf("解析服务器数据包生成时间失败：%v，使用当前时间", err))
+		serverTime = time.Now()
+	}
+
+	configMu.RLock()
+	scanListTime := config.ScanListTime
+	configMu.RUnlock()
+	if scanListTime.IsZero() {
+		addLog("info", "本地数据时间未设置")
+	} else {
+		addLog("info", fmt.Sprintf("本地数据时间：%s", formatTime(scanListTime)))
+	}
+
+	localStat, err := os.Stat(localPath)
+	localTime := time.Time{}
+	if err == nil {
+		localTime = localStat.ModTime()
+		addLog("info", fmt.Sprintf("本地数据包生成时间：%s", formatTime(localTime)))
+	}
+
+	compareTime := scanListTime
+	if compareTime.IsZero() {
+		compareTime = localTime
+	}
+
+	if !compareTime.IsZero() && serverTime.Sub(compareTime) <= 30*time.Minute {
+		addLog("info", fmt.Sprintf("服务器数据包与本地时间一致（时间差：%s），无需更新", serverTime.Sub(compareTime)))
+		return true, serverTime, nil
+	}
+	addLog("info", fmt.Sprintf("需更新数据包（时间差：%s）", serverTime.Sub(compareTime)))
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false, serverTime, fmt.Errorf("读取服务器数据包失败：%v", err)
+	}
+
+	localFile, err := os.Create(localPath)
+	if err != nil {
+		return false, serverTime, fmt.Errorf("创建本地数据包失败：%v", err)
+	}
+	defer localFile.Close()
+	if _, err := localFile.Write(body); err != nil {
+		return false, serverTime, fmt.Errorf("写入本地数据包失败：%v", err)
+	}
+
+	if err := os.Chtimes(localPath, serverTime, serverTime); err != nil {
+		addLog("error", fmt.Sprintf("设置 %s 的时间失败：%v", localPath, err))
+	}
+
+	addLog("info", "数据包文件已更新")
+	return false, serverTime, nil
+}
+
+// generateServerMap 解析.gz文件生成内存Map
+func generateServerMap(gzPath string, activePaths []string) (*ServerFileInfo, error) {
+	startTime := time.Now()
+	fileMap := make(FileInfoMap)
+	counts := make(map[string]int) // 路径计数
+
+	gzFile, err := os.Open(gzPath)
+	if err != nil {
+		return nil, err
+	}
+	defer gzFile.Close()
+
+	gz, err := gzip.NewReader(gzFile)
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+
+	scanner := bufio.NewScanner(gz)
+	pattern := regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2} /(.*)$`)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		match := pattern.FindStringSubmatch(line)
+		if match == nil {
+			continue
+		}
+
+		filePath := match[1]
+		timestampStr := strings.Fields(line)[0] + " " + strings.Fields(line)[1]
+		t, _ := time.Parse("2006-01-02 15:04", timestampStr)
+
+		// 路径过滤
+		for _, path := range activePaths {
+			if strings.HasPrefix(filePath, path) {
+				fileMap[filePath] = t.Unix()
+				counts[path]++ // 路径计数
+				break
+			}
+		}
+	}
+	addLog("success", fmt.Sprintf("服务器数据生成完成，共 %d 条记录，耗时 %s",
+		len(fileMap), formatDuration(time.Since(startTime))))
+
+	return &ServerFileInfo{
+		Files:  fileMap,
+		Counts: counts,
+	}, nil
+}
+
+// formatDuration 格式化时间间隔，保留小数点后两位
+func formatDuration(d time.Duration) string {
+	seconds := float64(d) / float64(time.Second)
+	return fmt.Sprintf("%.2f秒", seconds)
+}
+
+// contains 检查字符串是否在切片中
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
+// handleConfig 处理配置更新请求
+func handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+		return
+	}
+	var newConfig struct {
+		SPathsAll             *[]string `json:"sPathsAll,omitempty"`
+		SPool                 *[]string `json:"sPool,omitempty"`
+		ActivePaths           *[]string `json:"activePaths,omitempty"`
+		Interval              *int      `json:"interval,omitempty"`
+		DNSType               *DNSType  `json:"dnsType,omitempty"`
+		DNSServer             *string   `json:"dnsServer,omitempty"`
+		DNSEnabled            *bool     `json:"dnsEnabled,omitempty"`
+		LogSize               *int      `json:"logSize,omitempty"`
+		BandwidthLimitEnabled *bool     `json:"bandwidthLimitEnabled,omitempty"`
+		BandwidthLimitMBps    *float64  `json:"bandwidthLimitMBps,omitempty"`
+		MaxConcurrency        *int      `json:"maxConcurrency,omitempty"`
+		MemoryLimitEnabled    *bool     `json:"memoryLimitEnabled,omitempty"` // 新增
+		MemoryLimitMB         *float64  `json:"memoryLimitMB,omitempty"`      // 新增
+	}
+	if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
+		http.Error(w, "解析JSON数据失败", http.StatusBadRequest)
+		return
+	}
+	if newConfig.SPathsAll == nil && newConfig.SPool == nil && newConfig.ActivePaths == nil && newConfig.Interval == nil && newConfig.DNSType == nil && newConfig.DNSServer == nil && newConfig.DNSEnabled == nil && newConfig.LogSize == nil && newConfig.BandwidthLimitEnabled == nil && newConfig.BandwidthLimitMBps == nil && newConfig.MaxConcurrency == nil && newConfig.MemoryLimitEnabled == nil && newConfig.MemoryLimitMB == nil {
+		http.Error(w, "至少需要提供一个配置字段", http.StatusBadRequest)
+		return
+	}
+
+	dnsChanged := false
+	bandwidthChanged := false
+	configMu.Lock()
+	if newConfig.SPathsAll != nil {
+		config.SPathsAll = *newConfig.SPathsAll
+	}
+	if newConfig.ActivePaths != nil {
+		config.ActivePaths = *newConfig.ActivePaths
+		addLog("info", fmt.Sprintf("同步目录保存成功，共 %d 个", len(config.ActivePaths)))
+	}
+	if newConfig.Interval != nil {
+		if *newConfig.Interval <= 0 || *newConfig.Interval > 24 {
+			configMu.Unlock()
+			http.Error(w, "同步间隔必须为 1-24 的正整数", http.StatusBadRequest)
+			return
+		}
+		config.Interval = *newConfig.Interval
+		addLog("info", fmt.Sprintf("同步间隔更新为 %d 分钟", config.Interval))
+		select {
+		case intervalChange <- *newConfig.Interval:
+		default:
+			addLog("warning", "intervalChange 通道已满，ticker 可能未更新")
+		}
+	}
+	if newConfig.DNSType != nil || newConfig.DNSServer != nil || newConfig.DNSEnabled != nil {
+		dnsEnabled := config.DNSEnabled
+		if newConfig.DNSEnabled != nil {
+			dnsEnabled = *newConfig.DNSEnabled
+		}
+		dnsType := config.DNSType
+		if newConfig.DNSType != nil {
+			dnsType = *newConfig.DNSType
+			if dnsType != DNSTypeDoH && dnsType != DNSTypeDoT {
+				configMu.Unlock()
+				http.Error(w, "DNS 类型必须为 'doh' 或 'dot'", http.StatusBadRequest)
+				return
+			}
+		}
+		dnsServer := config.DNSServer
+		if newConfig.DNSServer != nil {
+			dnsServer = *newConfig.DNSServer
+		}
+		if dnsEnabled {
+			if dnsServer == "" {
+				configMu.Unlock()
+				http.Error(w, "DNS 服务器地址不能为空", http.StatusBadRequest)
+				return
+			}
+			if dnsType == DNSTypeDoH {
+				if !strings.HasPrefix(dnsServer, "http://") && !strings.HasPrefix(dnsServer, "https://") && !strings.Contains(dnsServer, "/dns-query") {
+					configMu.Unlock()
+					http.Error(w, "DoH 服务器需以 http:// 或 https:// 开头，或包含 /dns-query", http.StatusBadRequest)
+					return
+				}
+			} else if dnsType == DNSTypeDoT {
+				if !regexp.MustCompile(`^[\w.-]+(:[0-9]+)?$`).MatchString(dnsServer) {
+					configMu.Unlock()
+					http.Error(w, "DoT 服务器需为有效域名或 IP 地址，可选端口号（如 :853）", http.StatusBadRequest)
+					return
+				}
+			}
+		}
+		config.DNSType = dnsType
+		config.DNSServer = dnsServer
+		config.DNSEnabled = dnsEnabled
+		dnsChanged = true
+	}
+	if newConfig.LogSize != nil {
+		if *newConfig.LogSize <= 0 {
+			configMu.Unlock()
+			http.Error(w, "日志大小必须为正整数", http.StatusBadRequest)
+			return
+		}
+		oldLogs, _ := getLogs(config.LogSize, 1, "", "")
+		config.LogSize = *newConfig.LogSize
+		logsMu.Lock()
+		logs = ring.New(config.LogSize)
+		for i := 0; i < len(oldLogs) && i < config.LogSize; i++ {
+			logs.Value = oldLogs[len(oldLogs)-1-i]
+			logs = logs.Next()
+		}
+		logsMu.Unlock()
+		addLog("info", fmt.Sprintf("日志缓冲区大小更新为 %d", config.LogSize))
+	}
+	if newConfig.BandwidthLimitEnabled != nil {
+		config.BandwidthLimitEnabled = *newConfig.BandwidthLimitEnabled
+		bandwidthChanged = true
+		addLog("info", fmt.Sprintf("带宽限制已设置为 %v", config.BandwidthLimitEnabled))
+	}
+	if newConfig.BandwidthLimitMBps != nil {
+		if *newConfig.BandwidthLimitMBps <= 0 {
+			configMu.Unlock()
+			http.Error(w, "带宽限制必须为正数", http.StatusBadRequest)
+			return
+		}
+		config.BandwidthLimitMBps = *newConfig.BandwidthLimitMBps
+		bandwidthChanged = true
+		addLog("info", fmt.Sprintf("带宽限制值更新为 %.2f MB/s", config.BandwidthLimitMBps))
+	}
+	if newConfig.MaxConcurrency != nil {
+		if *newConfig.MaxConcurrency <= 0 {
+			configMu.Unlock()
+			http.Error(w, "最大并发数必须为正整数", http.StatusBadRequest)
+			return
+		}
+		config.MaxConcurrency = *newConfig.MaxConcurrency
+		addLog("info", fmt.Sprintf("最大并发数更新为 %d", config.MaxConcurrency))
+	}
+	if newConfig.MemoryLimitEnabled != nil {
+		config.MemoryLimitEnabled = *newConfig.MemoryLimitEnabled
+		addLog("info", fmt.Sprintf("内存限制已设置为 %v", config.MemoryLimitEnabled))
+	}
+	if newConfig.MemoryLimitMB != nil {
+		if *newConfig.MemoryLimitMB <= 0 {
+			configMu.Unlock()
+			http.Error(w, "内存限制必须为正数", http.StatusBadRequest)
+			return
+		}
+		config.MemoryLimitMB = *newConfig.MemoryLimitMB
+		addLog("info", fmt.Sprintf("内存限制值更新为 %.2f MB", config.MemoryLimitMB))
+	}
+	configMu.Unlock()
+
+	if dnsChanged || bandwidthChanged {
+		addLog("info", "网络配置已变更，开始重新初始化 HTTP 客户端")
+		initHttpClient()
+	}
+	if err := saveConfig(); err != nil {
+		http.Error(w, "保存配置文件失败", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(config)
+}
+
+// handlePaths 返回所有路径和激活路径
+func handlePaths(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	configMu.RLock()
+	defer configMu.RUnlock()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"allPaths":          config.SPathsAll,
+		"activePaths":       config.ActivePaths,
+		"pathUpdateNotices": config.PathUpdateNotices,
+	})
+}
+
+// handlePathsCount 返回本地路径的文件数量
+func handlePathsCount(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	configMu.RLock()
+	pathCounts := make(map[string]int)
+	for _, path := range config.SPathsAll {
+		count, exists := config.LocalPathCounts[path]
+		if !exists {
+			pathCounts[path] = -1 // 表示未知
+		} else {
+			pathCounts[path] = count
+		}
+	}
+	message := ""
+	if len(config.LocalPathCounts) == 0 {
+		message = "本地文件计数未生成，请触发刷新"
+	}
+	configMu.RUnlock()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"counts":  pathCounts,
+		"message": message,
+	})
+}
+
+// handleServerPathsCount 返回服务器路径的文件数量
+func handleServerPathsCount(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	configMu.RLock()
+	defer configMu.RUnlock()
+
+	pathCounts := make(map[string]int)
+	for _, path := range config.SPathsAll {
+		count, exists := config.ServerPathCounts[path]
+		if !exists {
+			pathCounts[path] = -1 // 表示未知
+		} else {
+			pathCounts[path] = count
+		}
+	}
+	json.NewEncoder(w).Encode(pathCounts)
+}
+
+// handleServers 返回服务器地址池
+func handleServers(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(config.SPool)
+}
+
+// handleLogs 返回最近的日志
+func handleLogs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	limitStr := r.URL.Query().Get("limit")
+	pageStr := r.URL.Query().Get("page")
+	filter := r.URL.Query().Get("filter")
+	search := r.URL.Query().Get("search")
+	action := r.URL.Query().Get("action")
+
+	limit := 100
+	if limitStr != "" {
+		fmt.Sscanf(limitStr, "%d", &limit)
+	}
+	if limit <= 0 || limit > config.LogSize {
+		limit = config.LogSize
+	}
+
+	page := 1
+	if pageStr != "" {
+		fmt.Sscanf(pageStr, "%d", &page)
+	}
+	if page <= 0 {
+		page = 1
+	}
+
+	if action == "export" {
+		logs, _ := getLogs(config.LogSize, 1, "", "")
+		w.Header().Set("Content-Disposition", "attachment; filename=logs.json")
+		json.NewEncoder(w).Encode(logs)
+		return
+	} else if action == "clear" {
+		logsMu.Lock()
+		logs = ring.New(config.LogSize)
+		logsMu.Unlock()
+		addLog("info", "日志已清空")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		return
+	}
+
+	logsData, total := getLogs(limit, page, filter, search)
+
+	estimatedMemory := config.LogSize * 50
+	var memoryStr string
+	if estimatedMemory >= 1024*1024 {
+		memoryStr = fmt.Sprintf("%.2f MB", float64(estimatedMemory)/(1024*1024))
+	} else if estimatedMemory >= 1024 {
+		memoryStr = fmt.Sprintf("%.2f KB", float64(estimatedMemory)/1024)
+	} else {
+		memoryStr = fmt.Sprintf("%d B", estimatedMemory)
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"logs":            logsData,
+		"total":           total,
+		"currentPage":     page,
+		"pageSize":        limit,
+		"logBufferSize":   config.LogSize,
+		"estimatedMemory": memoryStr,
+	})
+}
+
+// handleSync 返回同步状态
+func handleSync(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	syncStateMu.Lock()
+	defer syncStateMu.Unlock()
+	nextRun := ""
+	if !syncState.LastStart.IsZero() {
+		nextRun = formatTime(syncState.LastStart.Add(time.Duration(config.Interval) * time.Minute))
+	}
+	message := "同步 " + map[bool]string{true: "运行中", false: "已停止"}[syncState.Running]
+	json.NewEncoder(w).Encode(struct {
+		IsRunning bool   `json:"isRunning"`
+		Message   string `json:"message"`
+		NextRun   string `json:"nextRun"`
+		Interval  int    `json:"interval"`
+	}{
+		IsRunning: syncState.Running,
+		Message:   message,
+		NextRun:   nextRun,
+		Interval:  config.Interval,
+	})
+}
+
+// handleSyncStart 启动同步
+func handleSyncStart(w http.ResponseWriter, r *http.Request) {
+	syncStateMu.Lock()
+	defer syncStateMu.Unlock()
+	if syncState.Running {
+		addLog("info", "同步已在运行中，手动触发新一轮同步")
+	} else {
+		syncState.Running = true
+		addLog("info", "手动启动同步，开始新一轮同步")
+	}
+	// 非阻塞发送触发信号
+	select {
+	case syncState.Trigger <- struct{}{}:
+		addLog("info", "触发信号已发送")
+	default:
+		addLog("warning", "触发信号队列已满，同步可能已在处理")
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleSyncStop 停止同步
+func handleSyncStop(w http.ResponseWriter, r *http.Request) {
+	syncStateMu.Lock()
+	defer syncStateMu.Unlock()
+	if syncState.Running {
+		syncState.Running = false
+		select {
+		case syncState.SyncDone <- struct{}{}:
+			addLog("info", "手动停止主同步") // 修改：在锁内调用
+		default:
+			addLog("warning", "停止信号队列已满") // 新增
+		}
+	}
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleConfigGet 返回当前配置
+func handleConfigGet(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	configMu.RLock()
+	defer configMu.RUnlock()
+	json.NewEncoder(w).Encode(config)
+}
+
+// filterValidServers 过滤无效的服务器 URL
+func filterValidServers(servers []string) []string {
+	var validServers []string
+	for _, server := range servers {
+		server = strings.TrimSpace(server)
+		if server == "" {
+			continue
+		}
+		if !strings.HasPrefix(server, "http://") && !strings.HasPrefix(server, "https://") {
+			server = "https://" + server
+		}
+		if _, err := url.ParseRequestURI(server); err == nil {
+			validServers = append(validServers, server)
+		}
+	}
+	return validServers
+}
+
+// filterValidPaths 过滤无效的目录路径并规范化
+func filterValidPaths(paths []string) []string {
+	var validPaths []string
+	for _, path := range paths {
+		path = strings.TrimSpace(path)
+		if path == "" {
+			continue
+		}
+		// 清理非法字符并确保路径以 / 结尾
+		path = cleanFileName(path)
+		if !strings.HasSuffix(path, "/") {
+			path += "/"
+		}
+		validPaths = append(validPaths, path)
+	}
+	// 去重
+	uniquePaths := make([]string, 0, len(validPaths))
+	seen := make(map[string]bool)
+	for _, path := range validPaths {
+		if !seen[path] {
+			seen[path] = true
+			uniquePaths = append(uniquePaths, path)
+		}
+	}
+	return uniquePaths
+}
+
+// intersectPaths 返回两个路径切片的交集
+func intersectPaths(active, all []string) []string {
+	allSet := make(map[string]bool)
+	for _, path := range all {
+		allSet[path] = true
+	}
+	var result []string
+	for _, path := range active {
+		if allSet[path] {
+			result = append(result, path)
+		}
+	}
+	return result
+}
+
+// validateMediaDir 验证 media 目录是否有效
+func validateMediaDir(mediaDir string) error {
+	// 检查目录是否存在
+	stat, err := os.Stat(mediaDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("媒体目录 %s 不存在", mediaDir)
+		}
+		return fmt.Errorf("检查媒体目录 %s 失败：%v", mediaDir, err)
+	}
+	if !stat.IsDir() {
+		return fmt.Errorf("媒体目录 %s 不是一个目录", mediaDir)
+	}
+
+	// 检查是否存在“每日更新”文件夹
+	dailyUpdatePath := filepath.Join(mediaDir, "每日更新")
+	if _, err := os.Stat(dailyUpdatePath); os.IsNotExist(err) {
+		return fmt.Errorf("媒体目录 %s 下缺少 '每日更新' 文件夹", mediaDir)
+	} else if err != nil {
+		return fmt.Errorf("检查 '每日更新' 文件夹失败：%v", err)
+	}
+
+	return nil
+}
+
+// checkMediaPermissions 检查媒体目录的读、写、执行权限
+func checkMediaPermissions(mediaDir string) error {
+	// 检查读权限：尝试打开目录并读取内容
+	dir, err := os.Open(mediaDir)
+	if err != nil {
+		return fmt.Errorf("无读权限（无法打开目录）：%v", err)
+	}
+	_, err = dir.Readdirnames(1) // 尝试读取至少一个条目
+	dir.Close()
+	if err != nil && err != io.EOF {
+		return fmt.Errorf("无读权限（无法读取目录内容）：%v", err)
+	}
+
+	// 检查执行权限：检查文件模式并尝试访问子目录
+	stat, err := os.Stat(mediaDir)
+	if err != nil {
+		return fmt.Errorf("无法获取目录权限信息：%v", err)
+	}
+	mode := stat.Mode()
+	if mode&0o100 == 0 { // 检查用户执行权限
+		return fmt.Errorf("无执行权限（目录不可遍历）")
+	}
+	// 验证子目录访问（每日更新由 validateMediaDir 保证存在）
+	dailyUpdatePath := filepath.Join(mediaDir, "每日更新")
+	if _, err := os.Stat(dailyUpdatePath); err != nil {
+		return fmt.Errorf("无执行权限（无法访问子目录）：%v", err)
+	}
+
+	// 检查写权限：尝试创建并删除临时文件
+	tempFile := filepath.Join(mediaDir, ".perm_test")
+	file, err := os.Create(tempFile)
+	if err != nil {
+		return fmt.Errorf("无写权限（无法创建文件）：%v", err)
+	}
+	file.Close()
+	if err := os.Remove(tempFile); err != nil {
+		return fmt.Errorf("无写权限（无法删除文件）：%v", err)
+	}
+
+	return nil
+}
+
+// handleRecycleBinCount 返回回收站文件数量
+func handleRecycleBinCount(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	mediaDir := flag.Lookup("media").Value.String()
+	recycleDir := filepath.Join(mediaDir, "recycle_bin")
+	var fileCount int
+	err := filepath.Walk(recycleDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			fileCount++
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		http.Error(w, "统计回收站文件失败", http.StatusInternalServerError)
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]int{"fileCount": fileCount})
+}
+
+// handleRecycleBinClear 清空回收站
+func handleRecycleBinClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+		return
+	}
+
+	mediaDir := flag.Lookup("media").Value.String()
+	recycleDir := filepath.Join(mediaDir, "recycle_bin")
+
+	// 统计文件数量
+	var fileCount int
+	err := filepath.Walk(recycleDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			fileCount++
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		http.Error(w, "统计回收站文件失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 直接删除整个 recycle_bin 文件夹
+	if err := os.RemoveAll(recycleDir); err != nil {
+		http.Error(w, "清空回收站失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 重新创建空的 recycle_bin 文件夹
+	if err := os.MkdirAll(recycleDir, 0777); err != nil {
+		http.Error(w, "重建回收站目录失败", http.StatusInternalServerError)
+		return
+	}
+
+	addLog("success", fmt.Sprintf("回收站已清空，删除 %d 个文件", fileCount))
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"message": fmt.Sprintf("已清空 %d 个文件", fileCount),
+	})
+}
+
+// handleRecycleBinList 返回回收站文件树列表
+func handleRecycleBinList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	mediaDir := flag.Lookup("media").Value.String()
+	recycleDir := filepath.Join(mediaDir, "recycle_bin")
+
+	var filePaths []string
+	err := filepath.Walk(recycleDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			relativePath, err := filepath.Rel(mediaDir, path)
+			if err != nil {
+				return err
+			}
+			relativePath = filepath.ToSlash(relativePath)
+			filePaths = append(filePaths, relativePath)
+		}
+		return nil
+	})
+
+	if err != nil && !os.IsNotExist(err) {
+		addLog("error", fmt.Sprintf("遍历回收站目录失败：%v", err))
+		http.Error(w, "获取回收站文件列表失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 如果回收站为空，返回提示
+	if len(filePaths) == 0 {
+		w.Write([]byte("回收站为空"))
+		return
+	}
+
+	// 按路径排序，确保输出有序
+	sort.Strings(filePaths)
+	// 拼接 TXT 内容，每行一个路径
+	output := strings.Join(filePaths, "\n")
+	w.Write([]byte(output))
+}
+
+// handleResetScanListTime 将 scanListTime 重置为固定时间以触发同步
+func handleResetScanListTime(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+		return
+	}
+
+	configMu.Lock()
+	oldTime := config.ScanListTime
+	config.ScanListTime = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := saveConfig(); err != nil {
+		configMu.Unlock()
+		http.Error(w, "保存配置文件失败", http.StatusInternalServerError)
+		return
+	}
+	configMu.Unlock()
+
+	syncStateMu.Lock()
+	select {
+	case syncState.Trigger <- struct{}{}:
+		addLog("info", "重置数据包时间后触发主同步")
+	default:
+		addLog("warning", "触发信号队列已满，主同步可能已在处理")
+	}
+	syncStateMu.Unlock()
+
+	addLog("info", fmt.Sprintf("数据包日期 从 %s 重置为 %s", formatTime(oldTime), formatTime(config.ScanListTime)))
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"message": "数据包时间已重置，已触发同步",
+	})
+}
+
+// handleResources 返回当前资源使用情况或触发垃圾回收
+func handleResources(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	action := r.URL.Query().Get("action")
+
+	if action == "gc" {
+		runtime.GC()
+		addLog("info", "手动触发垃圾回收")
+		json.NewEncoder(w).Encode(map[string]string{"status": "ok", "message": "垃圾回收已触发"})
+		return
+	}
+
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	// 内存使用（分配的堆内存，单位 MB）
+	memUsageMB := float64(memStats.Alloc) / (1024 * 1024)
+
+	// CPU 使用率
+	cpuCores := runtime.NumCPU()
+	percents, err := cpu.Percent(100*time.Millisecond, true)
+	if err != nil {
+		addLog("warning", fmt.Sprintf("获取 CPU 使用率失败：%v", err))
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"cpuUsagePercent": 0,
+			"memoryUsageMB":   math.Round(memUsageMB*100) / 100,
+			"goroutines":      runtime.NumGoroutine(),
+			"cpuCores":        cpuCores,
+			"cpuDetails":      make([]float64, cpuCores),
+		})
+		return
+	}
+
+	// 计算总 CPU 使用率
+	var totalPercent float64
+	coreUsage := make([]float64, cpuCores)
+	for i, percent := range percents {
+		if i < cpuCores {
+			coreUsage[i] = math.Round(percent*100) / 100
+			totalPercent += percent
+		}
+	}
+	cpuUsagePercent := math.Round(totalPercent/float64(cpuCores)*100) / 100
+	if cpuUsagePercent > 100 {
+		cpuUsagePercent = 100
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"cpuUsagePercent": cpuUsagePercent,
+		"memoryUsageMB":   math.Round(memUsageMB*100) / 100,
+		"goroutines":      runtime.NumGoroutine(),
+		"cpuCores":        cpuCores,
+		"cpuDetails":      coreUsage,
+	})
+}
+
+func main() {
+	var err error
+	shanghaiLoc, err = time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "加载时区失败：%v\n", err)
+		os.Exit(1)
+	}
+	media := flag.String("media", "", "存储下载媒体文件的路径（必须）")
+	port := flag.Int("port", 8080, "HTTP 服务器端口（默认 8080）")
+	flag.Parse()
+	// 初始化日志缓冲区（使用默认大小，稍后根据配置调整）
+	logsMu.Lock()
+	logs = ring.New(50000) // 初始默认大小 50000
+	logsMu.Unlock()
+	// 加载配置文件
+	if err := loadConfig(); err != nil {
+		fmt.Fprintf(os.Stderr, "加载配置文件失败：%v\n", err)
+		os.Exit(1)
+	}
+	// 下载服务器列表并更新 sPool
+	fmt.Fprintf(os.Stdout, "尝试更新爬虫服务器列表,请稍等...\n")
+	resp, err := http.Get("http://192.168.31.4:5244/d/115/crawler_sites.list")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "下载服务器列表失败：%v，使用默认列表.\n", err)
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "读取服务器列表失败：%v，使用默认列表.\n", err)
+			} else {
+				servers := strings.Split(strings.TrimSpace(string(body)), "\n")
+				servers = filterValidServers(servers)
+				if len(servers) > 0 {
+					configMu.Lock()
+					config.SPool = servers
+					configMu.Unlock()
+					if err := saveConfig(); err != nil {
+						fmt.Fprintf(os.Stderr, "保存服务器列表到配置文件失败：%v\n", err)
+					} else {
+						fmt.Fprintf(os.Stdout, "服务器列表更新成功，共 %d 个服务器\n", len(servers))
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "使用默认服务器列表\n")
+				}
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "下载服务器列表失败，状态码：%d，使用默认列表.\n", resp.StatusCode)
+		}
+	}
+
+	// 下载目录列表并更新 sPathsAll
+	fmt.Fprintf(os.Stdout, "尝试更新媒体列表,请稍等...\n")
+	resp, err = http.Get("https://docker.xiaoya.pro/crawler_dir.txt")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "下载目录列表失败：%v，使用默认列表.\n", err)
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "读取目录列表失败：%v，使用默认列表.\n", err)
+			} else {
+				paths := strings.Split(strings.TrimSpace(string(body)), "\n")
+				paths = filterValidPaths(paths)
+				if len(paths) > 0 {
+					configMu.Lock()
+					config.SPathsAll = paths
+					config.ActivePaths = intersectPaths(config.ActivePaths, paths)
+					configMu.Unlock()
+					if err := saveConfig(); err != nil {
+						fmt.Fprintf(os.Stderr, "保存目录列表到配置文件失败：%v\n", err)
+					} else {
+						fmt.Fprintf(os.Stdout, "目录列表更新成功，共 %d 个目录\n", len(paths))
+					}
+				} else {
+					fmt.Fprintf(os.Stderr, "使用默认目录列表\n")
+				}
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "下载目录列表失败，状态码：%d，使用默认列表.\n", resp.StatusCode)
+		}
+	}
+
+	logsMu.Lock()
+	logs = ring.New(config.LogSize)
+	logsMu.Unlock()
+
+	if *port < 1 || *port > 65535 {
+		fmt.Fprintf(os.Stderr, "端口 %d 无效，必须在 1-65535 范围内\n", *port)
+		os.Exit(1)
+	}
+	if err := validateMediaDir(*media); err != nil {
+		fmt.Fprintf(os.Stderr, "无效的媒体目录：%v\n", err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stdout, "媒体目录 %s 有效,", *media)
+	if err := checkMediaPermissions(*media); err != nil {
+		fmt.Fprintf(os.Stderr, " %s 权限不足：%v\n", *media, err)
+		os.Exit(1)
+	}
+	fmt.Fprintf(os.Stdout, "权限检查通过，具备读、写、执行权限\n")
+	initHttpClient()
+
+	addLog("info", "程序初始化完成，开始后台同步")
+	go syncFiles(media)
+
+	subFS, _ := fs.Sub(staticFiles, "static")
+	fs := http.FileServer(http.FS(subFS))
+	http.HandleFunc("/api/config", handleConfig)
+	http.HandleFunc("/api/paths", handlePaths)
+	http.HandleFunc("/api/paths/count", handlePathsCount)
+	http.HandleFunc("/api/server-paths-count", handleServerPathsCount)
+	http.HandleFunc("/api/servers", handleServers)
+	http.HandleFunc("/api/logs", handleLogs)
+	http.HandleFunc("/api/sync", handleSync)
+	http.HandleFunc("/api/sync/start", handleSyncStart)
+	http.HandleFunc("/api/sync/stop", handleSyncStop)
+	http.HandleFunc("/api/config/get", handleConfigGet)
+	http.HandleFunc("/api/refresh-local", handleRefreshLocal)
+	http.HandleFunc("/api/recycle-bin/count", handleRecycleBinCount)
+	http.HandleFunc("/api/recycle-bin/clear", handleRecycleBinClear)
+	http.HandleFunc("/api/recycle-bin/list", handleRecycleBinList)
+	http.HandleFunc("/api/reset-scanlist-time", handleResetScanListTime)
+	http.HandleFunc("/api/resources", handleResources)
+	http.Handle("/", fs)
+
+	addr := fmt.Sprintf(":%d", *port)
+	fmt.Fprintf(os.Stdout, "页面已启动，请访问端口 %d\n", *port)
+	err = http.ListenAndServe(addr, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "服务器启动失败：%v\n", err)
+		addLog("error", fmt.Sprintf("服务器启动失败（端口 %d）：%v", *port, err))
+		os.Exit(1)
+	}
+}
