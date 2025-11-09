@@ -1644,58 +1644,62 @@ func contains(slice []string, item string) bool {
 
 // handleConfig 处理配置更新请求
 func handleConfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
-		return
-	}
-	var newConfig struct {
-		SPathsAll             *[]string `json:"sPathsAll,omitempty"`
-		SPool                 *[]string `json:"sPool,omitempty"`
-		ActivePaths           *[]string `json:"activePaths,omitempty"`
-		Interval              *int      `json:"interval,omitempty"`
-		DNSType               *DNSType  `json:"dnsType,omitempty"`
-		DNSServer             *string   `json:"dnsServer,omitempty"`
-		DNSEnabled            *bool     `json:"dnsEnabled,omitempty"`
-		LogSize               *int      `json:"logSize,omitempty"`
-		BandwidthLimitEnabled *bool     `json:"bandwidthLimitEnabled,omitempty"`
-		BandwidthLimitMBps    *float64  `json:"bandwidthLimitMBps,omitempty"`
-		MaxConcurrency        *int      `json:"maxConcurrency,omitempty"`
-		MemoryLimitEnabled    *bool     `json:"memoryLimitEnabled,omitempty"` // 新增
-		MemoryLimitMB         *float64  `json:"memoryLimitMB,omitempty"`      // 新增
-	}
-	if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
-		http.Error(w, "解析JSON数据失败", http.StatusBadRequest)
-		return
-	}
-	if newConfig.SPathsAll == nil && newConfig.SPool == nil && newConfig.ActivePaths == nil && newConfig.Interval == nil && newConfig.DNSType == nil && newConfig.DNSServer == nil && newConfig.DNSEnabled == nil && newConfig.LogSize == nil && newConfig.BandwidthLimitEnabled == nil && newConfig.BandwidthLimitMBps == nil && newConfig.MaxConcurrency == nil && newConfig.MemoryLimitEnabled == nil && newConfig.MemoryLimitMB == nil {
-		http.Error(w, "至少需要提供一个配置字段", http.StatusBadRequest)
-		return
-	}
+    if r.Method != http.MethodPost {
+        http.Error(w, "只支持POST请求", http.StatusMethodNotAllowed)
+        return
+    }
+    var newConfig struct {
+        SPathsAll             *[]string `json:"sPathsAll,omitempty"`
+        SPool                 *[]string `json:"sPool,omitempty"`
+        ActivePaths           *[]string `json:"activePaths,omitempty"`
+        Interval              *int      `json:"interval,omitempty"`
+        DNSType               *DNSType  `json:"dnsType,omitempty"`
+        DNSServer             *string   `json:"dnsServer,omitempty"`
+        DNSEnabled            *bool     `json:"dnsEnabled,omitempty"`
+        LogSize               *int      `json:"logSize,omitempty"`
+        BandwidthLimitEnabled *bool     `json:"bandwidthLimitEnabled,omitempty"`
+        BandwidthLimitMBps    *float64  `json:"bandwidthLimitMBps,omitempty"`
+        MaxConcurrency        *int      `json:"maxConcurrency,omitempty"`
+        MemoryLimitEnabled    *bool     `json:"memoryLimitEnabled,omitempty"` // 新增
+        MemoryLimitMB         *float64  `json:"memoryLimitMB,omitempty"`      // 新增
+    }
+    if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
+        http.Error(w, "解析JSON数据失败", http.StatusBadRequest)
+        return
+    }
+    if newConfig.SPathsAll == nil && newConfig.SPool == nil && newConfig.ActivePaths == nil && newConfig.Interval == nil && newConfig.DNSType == nil && newConfig.DNSServer == nil && newConfig.DNSEnabled == nil && newConfig.LogSize == nil && newConfig.BandwidthLimitEnabled == nil && newConfig.BandwidthLimitMBps == nil && newConfig.MaxConcurrency == nil && newConfig.MemoryLimitEnabled == nil && newConfig.MemoryLimitMB == nil {
+        http.Error(w, "至少需要提供一个配置字段", http.StatusBadRequest)
+        return
+    }
 
-	dnsChanged := false
-	bandwidthChanged := false
-	configMu.Lock()
-	if newConfig.SPathsAll != nil {
-		config.SPathsAll = *newConfig.SPathsAll
-	}
-	if newConfig.ActivePaths != nil {
-		config.ActivePaths = *newConfig.ActivePaths
-		addLog("info", fmt.Sprintf("同步目录保存成功，共 %d 个", len(config.ActivePaths)))
-	}
-	if newConfig.Interval != nil {
-		if *newConfig.Interval <= 0 || *newConfig.Interval > 1440 {
-			configMu.Unlock()
-			http.Error(w, "同步间隔必须为 1-1440 的正整数", http.StatusBadRequest)
-			return
-		}
-		config.Interval = *newConfig.Interval
-		addLog("info", fmt.Sprintf("同步间隔更新为 %d 分钟", config.Interval))
-		select {
-		case intervalChange <- *newConfig.Interval:
-		default:
-			addLog("warning", "intervalChange 通道已满，ticker 可能未更新")
-		}
-	}
+    // 先验证 Interval，在加锁之前
+    if newConfig.Interval != nil {
+        if *newConfig.Interval <= 0 || *newConfig.Interval > 1440 {
+            http.Error(w, "同步间隔必须为 1-1440 的正整数（分钟）", http.StatusBadRequest)
+            return
+        }
+    }
+
+    dnsChanged := false
+    bandwidthChanged := false
+    configMu.Lock()
+    
+    if newConfig.SPathsAll != nil {
+        config.SPathsAll = *newConfig.SPathsAll
+    }
+    if newConfig.ActivePaths != nil {
+        config.ActivePaths = *newConfig.ActivePaths
+        addLog("info", fmt.Sprintf("同步目录保存成功，共 %d 个", len(config.ActivePaths)))
+    }
+    if newConfig.Interval != nil {
+        config.Interval = *newConfig.Interval
+        addLog("info", fmt.Sprintf("同步间隔更新为 %d 分钟", config.Interval))
+        select {
+        case intervalChange <- *newConfig.Interval:
+        default:
+            addLog("warning", "intervalChange 通道已满，ticker 可能未更新")
+        }
+    }
 	if newConfig.DNSType != nil || newConfig.DNSServer != nil || newConfig.DNSEnabled != nil {
 		dnsEnabled := config.DNSEnabled
 		if newConfig.DNSEnabled != nil {
