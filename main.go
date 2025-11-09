@@ -1660,8 +1660,8 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
         BandwidthLimitEnabled *bool     `json:"bandwidthLimitEnabled,omitempty"`
         BandwidthLimitMBps    *float64  `json:"bandwidthLimitMBps,omitempty"`
         MaxConcurrency        *int      `json:"maxConcurrency,omitempty"`
-        MemoryLimitEnabled    *bool     `json:"memoryLimitEnabled,omitempty"` // 新增
-        MemoryLimitMB         *float64  `json:"memoryLimitMB,omitempty"`      // 新增
+        MemoryLimitEnabled    *bool     `json:"memoryLimitEnabled,omitempty"`
+        MemoryLimitMB         *float64  `json:"memoryLimitMB,omitempty"`
     }
     if err := json.NewDecoder(r.Body).Decode(&newConfig); err != nil {
         http.Error(w, "解析JSON数据失败", http.StatusBadRequest)
