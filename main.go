@@ -503,7 +503,7 @@ func loadConfig() error {
 		// 根目录也没有 config.json，创建默认配置
 		configMu.Lock()
 		config = Config{
-			Interval:              1,
+			Interval:              60, // 默认 60 分钟
 			DNSType:               DNSTypeDoH,
 			DNSServer:             "https://1.1.1.1/dns-query",
 			DNSEnabled:            true,
@@ -533,7 +533,7 @@ func loadConfig() error {
 		newConfig.LogSize = 1000
 	}
 	if newConfig.Interval <= 0 {
-		newConfig.Interval = 1
+		newConfig.Interval = 60 // 默认 60 分钟
 	}
 	if newConfig.MaxConcurrency <= 0 {
 		newConfig.MaxConcurrency = 500
@@ -1068,8 +1068,8 @@ func syncFiles(media *string) {
 	interval := config.Interval
 	configMu.RUnlock()
 	if interval <= 0 {
-		interval = 12
-		addLog("warning", "同步间隔无效，强制设置为 12 分钟")
+		interval = 60
+		addLog("warning", "同步间隔无效，强制设置为 60 分钟")
 		configMu.Lock()
 		config.Interval = interval
 		configMu.Unlock()
@@ -1672,26 +1672,17 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    // 先验证 Interval，在加锁之前
+    dnsChanged := false
+    bandwidthChanged := false
+    configMu.Lock()
+    defer configMu.Unlock()
+
+    // 将 Interval 验证移到加锁之后
     if newConfig.Interval != nil {
         if *newConfig.Interval <= 0 || *newConfig.Interval > 1440 {
             http.Error(w, "同步间隔必须为 1-1440 的正整数（分钟）", http.StatusBadRequest)
             return
         }
-    }
-
-    dnsChanged := false
-    bandwidthChanged := false
-    configMu.Lock()
-    
-    if newConfig.SPathsAll != nil {
-        config.SPathsAll = *newConfig.SPathsAll
-    }
-    if newConfig.ActivePaths != nil {
-        config.ActivePaths = *newConfig.ActivePaths
-        addLog("info", fmt.Sprintf("同步目录保存成功，共 %d 个", len(config.ActivePaths)))
-    }
-    if newConfig.Interval != nil {
         config.Interval = *newConfig.Interval
         addLog("info", fmt.Sprintf("同步间隔更新为 %d 分钟", config.Interval))
         select {
@@ -1699,6 +1690,14 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
         default:
             addLog("warning", "intervalChange 通道已满，ticker 可能未更新")
         }
+    }
+    
+    if newConfig.SPathsAll != nil {
+        config.SPathsAll = *newConfig.SPathsAll
+    }
+    if newConfig.ActivePaths != nil {
+        config.ActivePaths = *newConfig.ActivePaths
+        addLog("info", fmt.Sprintf("同步目录保存成功，共 %d 个", len(config.ActivePaths)))
     }
 	if newConfig.DNSType != nil || newConfig.DNSServer != nil || newConfig.DNSEnabled != nil {
 		dnsEnabled := config.DNSEnabled
@@ -1709,7 +1708,6 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		if newConfig.DNSType != nil {
 			dnsType = *newConfig.DNSType
 			if dnsType != DNSTypeDoH && dnsType != DNSTypeDoT {
-				configMu.Unlock()
 				http.Error(w, "DNS 类型必须为 'doh' 或 'dot'", http.StatusBadRequest)
 				return
 			}
@@ -1720,19 +1718,16 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 		}
 		if dnsEnabled {
 			if dnsServer == "" {
-				configMu.Unlock()
 				http.Error(w, "DNS 服务器地址不能为空", http.StatusBadRequest)
 				return
 			}
 			if dnsType == DNSTypeDoH {
 				if !strings.HasPrefix(dnsServer, "http://") && !strings.HasPrefix(dnsServer, "https://") && !strings.Contains(dnsServer, "/dns-query") {
-					configMu.Unlock()
 					http.Error(w, "DoH 服务器需以 http:// 或 https:// 开头，或包含 /dns-query", http.StatusBadRequest)
 					return
 				}
 			} else if dnsType == DNSTypeDoT {
 				if !regexp.MustCompile(`^[\w.-]+(:[0-9]+)?$`).MatchString(dnsServer) {
-					configMu.Unlock()
 					http.Error(w, "DoT 服务器需为有效域名或 IP 地址，可选端口号（如 :853）", http.StatusBadRequest)
 					return
 				}
@@ -1745,7 +1740,6 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if newConfig.LogSize != nil {
 		if *newConfig.LogSize <= 0 {
-			configMu.Unlock()
 			http.Error(w, "日志大小必须为正整数", http.StatusBadRequest)
 			return
 		}
@@ -1767,7 +1761,6 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if newConfig.BandwidthLimitMBps != nil {
 		if *newConfig.BandwidthLimitMBps <= 0 {
-			configMu.Unlock()
 			http.Error(w, "带宽限制必须为正数", http.StatusBadRequest)
 			return
 		}
@@ -1777,7 +1770,6 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if newConfig.MaxConcurrency != nil {
 		if *newConfig.MaxConcurrency <= 0 {
-			configMu.Unlock()
 			http.Error(w, "最大并发数必须为正整数", http.StatusBadRequest)
 			return
 		}
@@ -1790,18 +1782,16 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 	}
 	if newConfig.MemoryLimitMB != nil {
 		if *newConfig.MemoryLimitMB <= 0 {
-			configMu.Unlock()
 			http.Error(w, "内存限制必须为正数", http.StatusBadRequest)
 			return
 		}
 		config.MemoryLimitMB = *newConfig.MemoryLimitMB
 		addLog("info", fmt.Sprintf("内存限制值更新为 %.2f MB", config.MemoryLimitMB))
 	}
-	configMu.Unlock()
 
 	if dnsChanged || bandwidthChanged {
 		addLog("info", "网络配置已变更，开始重新初始化 HTTP 客户端")
-		initHttpClient()
+		go initHttpClient() // 异步重新初始化，避免阻塞
 	}
 	if err := saveConfig(); err != nil {
 		http.Error(w, "保存配置文件失败", http.StatusInternalServerError)
@@ -2078,7 +2068,7 @@ func validateMediaDir(mediaDir string) error {
 		return fmt.Errorf("媒体目录 %s 不是一个目录", mediaDir)
 	}
 
-	// 检查是否存在“每日更新”文件夹
+	// 检查是否存在"每日更新"文件夹
 	dailyUpdatePath := filepath.Join(mediaDir, "每日更新")
 	if _, err := os.Stat(dailyUpdatePath); os.IsNotExist(err) {
 		return fmt.Errorf("媒体目录 %s 下缺少 '每日更新' 文件夹", mediaDir)
